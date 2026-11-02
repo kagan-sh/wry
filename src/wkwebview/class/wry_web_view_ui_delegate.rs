@@ -135,8 +135,9 @@ define_class!(
       _capture_type: WKMediaCaptureType,
       decision_handler: &Block<dyn Fn(WKPermissionDecision)>,
     ) {
+      // kagan: pages never get the camera or microphone.
       //https://developer.apple.com/documentation/webkit/wkpermissiondecision?language=objc
-      (*decision_handler).call((WKPermissionDecision::Grant,));
+      (*decision_handler).call((WKPermissionDecision::Deny,));
     }
 
     #[cfg(target_os = "macos")]
