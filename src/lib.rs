@@ -751,6 +751,17 @@ pub struct WebViewAttributes<'a> {
   /// - **macOS / iOS**: Uses the nonPersistent DataStore.
   pub incognito: bool,
 
+  /// Whether the page may open the system file dialog (`<input type="file">`).
+  ///
+  /// Defaults to `true`. When `false`, the open-panel completion handler receives
+  /// null and the dialog is never shown.
+  ///
+  /// ## Platform-specific:
+  ///
+  /// - **macOS / iOS:** Honored in the WKUIDelegate open-panel callback.
+  /// - **Windows / Linux / Android:** Not yet wired; the default remains allow.
+  pub file_dialog: bool,
+
   /// Whether all media can be played without user interaction.
   pub autoplay: bool,
 
@@ -824,6 +835,7 @@ impl Default for WebViewAttributes<'_> {
       back_forward_navigation_gestures: false,
       document_title_changed_handler: None,
       incognito: false,
+      file_dialog: true,
       autoplay: true,
       on_page_load_handler: None,
       proxy_config: None,
@@ -1340,6 +1352,14 @@ impl<'a> WebViewBuilder<'a> {
   /// - **Android:** Unsupported yet.
   pub fn with_incognito(mut self, incognito: bool) -> Self {
     self.attrs.incognito = incognito;
+    self
+  }
+
+  /// Whether the page may open the system file dialog (`<input type="file">`).
+  ///
+  /// Defaults to `true`. Pass `false` to refuse the dialog (completion handler gets null).
+  pub fn with_file_dialog(mut self, file_dialog: bool) -> Self {
+    self.attrs.file_dialog = file_dialog;
     self
   }
 

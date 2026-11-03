@@ -86,6 +86,7 @@ pub struct WryWebViewUIDelegateIvars {
     Option<Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse + Send + Sync>>,
   #[cfg(target_os = "macos")]
   new_windows: Rc<RefCell<Vec<NewWindow>>>,
+  file_dialog: bool,
 }
 
 define_class!(
@@ -108,6 +109,10 @@ define_class!(
       handler: &block2::Block<dyn Fn(*const NSArray<NSURL>)>,
     ) {
       unsafe {
+        if !self.ivars().file_dialog {
+          (*handler).call((null_mut(),));
+          return;
+        }
         if let Some(mtm) = MainThreadMarker::new() {
           let open_panel = NSOpenPanel::openPanel(mtm);
           open_panel.setCanChooseFiles(true);
@@ -272,6 +277,7 @@ impl WryWebViewUIDelegate {
     new_window_req_handler: Option<
       Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse + Send + Sync>,
     >,
+    file_dialog: bool,
   ) -> Retained<Self> {
     #[cfg(target_os = "ios")]
     let _new_window_req_handler = new_window_req_handler;
@@ -283,6 +289,7 @@ impl WryWebViewUIDelegate {
         new_window_req_handler,
         #[cfg(target_os = "macos")]
         new_windows: Rc::new(RefCell::new(vec![])),
+        file_dialog,
       });
     unsafe { msg_send![super(delegate), init] }
   }

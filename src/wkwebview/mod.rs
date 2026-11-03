@@ -564,8 +564,11 @@ impl InnerWebView {
       let proto_navigation_policy_delegate = ProtocolObject::from_ref(&*navigation_policy_delegate);
       webview.setNavigationDelegate(Some(proto_navigation_policy_delegate));
 
-      let ui_delegate: Retained<WryWebViewUIDelegate> =
-        WryWebViewUIDelegate::new(mtm, attributes.new_window_req_handler);
+      let ui_delegate: Retained<WryWebViewUIDelegate> = WryWebViewUIDelegate::new(
+        mtm,
+        attributes.new_window_req_handler,
+        attributes.file_dialog,
+      );
       let proto_ui_delegate = ProtocolObject::from_ref(&*ui_delegate);
       webview.setUIDelegate(Some(proto_ui_delegate));
 
