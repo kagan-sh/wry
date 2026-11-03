@@ -220,14 +220,14 @@ impl InnerWebView {
     };
     // SAFETY: WebView2 COM calls on this thread need an STA. A second call returns S_FALSE.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    let hwnd = Self::create_dispatch_hwnd()?;
+    let hwnd = DispatchWindow(Self::create_dispatch_hwnd()?);
     // File drops need a child window. The composition host has none.
     let _ = attributes.drag_drop_handler.take();
     let bounds = attributes.bounds;
     let id = attributes
       .id
       .map(|id| id.to_string())
-      .unwrap_or_else(|| (hwnd.0 as isize).to_string());
+      .unwrap_or_else(|| (hwnd.0 .0 as isize).to_string());
     let background_color = if attributes.transparent {
       Some((0, 0, 0, 0))
     } else {
@@ -245,6 +245,7 @@ impl InnerWebView {
       background_color,
       root_visual,
     )?;
+    let hwnd = hwnd.take();
     // `is_child` skips the parent size subclass. The dispatch window is not the page.
     let webview = Self::init_webview(
       parent,
@@ -557,8 +558,44 @@ impl InnerWebView {
     let composition = self
       .controller
       .cast::<ICoreWebView2CompositionController>()?;
+    if let PagePointer::Wheel {
+      x,
+      y,
+      delta_x,
+      delta_y,
+      control,
+      shift,
+    } = event
+    {
+      let keys = wheel_keys(control, shift);
+      let point = POINT { x, y };
+      if delta_y != 0 {
+        // SAFETY: composition controller is live; point matches Bounds units.
+        unsafe {
+          composition.SendMouseInput(
+            COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
+            keys,
+            delta_y as u32,
+            point,
+          )?;
+        }
+      }
+      if delta_x != 0 {
+        // SAFETY: composition controller is live; point matches Bounds units.
+        unsafe {
+          composition.SendMouseInput(
+            COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
+            keys,
+            delta_x as u32,
+            point,
+          )?;
+        }
+      }
+      return Ok(());
+    }
     let (kind, keys, data, point) = event.parts();
-    // SAFETY: this controller was created for the composition host, and the point is in its client DIPs.
+    // SAFETY: this controller was created for the composition host. The point is in the same
+    // client units as Bounds (raw pixels when BoundsMode is UseRawPixels).
     unsafe { composition.SendMouseInput(kind, keys, data, point)? };
     Ok(())
   }
@@ -915,6 +952,8 @@ impl InnerWebView {
 
     // Camera and microphone are always refused. Clipboard read stays opt-in.
     let clipboard = attributes.clipboard;
+    // SAFETY: `webview` is this page's live ICoreWebView2 on the UI thread. The handler
+    // AddRefs through the event token and only runs while that interface stays registered.
     unsafe {
       webview.add_PermissionRequested(
         &PermissionRequestedEventHandler::create(Box::new(move |_, args| {
@@ -1881,18 +1920,20 @@ impl InnerWebView {
     let dpi = unsafe { util::hwnd_dpi(hwnd) };
     let scale_factor = util::dpi_to_scale_factor(dpi);
     if self.composed {
-      let size = bounds.size.to_logical::<f64>(scale_factor);
-      // SAFETY: the controller belongs to this page. The rect is the page size in DIPs at the parent DPI.
+      let size = bounds.size.to_physical::<i32>(scale_factor);
+      // SAFETY: the controller belongs to this page. Bounds are raw pixels matching the
+      // composition visual; RasterizationScale keeps content DPI correct when the monitor changes.
       unsafe {
+        if let Ok(controller) = self.controller.cast::<ICoreWebView2Controller3>() {
+          controller.SetBoundsMode(COREWEBVIEW2_BOUNDS_MODE_USE_RAW_PIXELS)?;
+          controller.SetRasterizationScale(scale_factor)?;
+        }
         self.controller.SetBounds(RECT {
           top: 0,
           left: 0,
-          right: size.width.round() as i32,
-          bottom: size.height.round() as i32,
+          right: size.width,
+          bottom: size.height,
         })?;
-        if let Ok(controller) = self.controller.cast::<ICoreWebView2Controller3>() {
-          controller.SetRasterizationScale(scale_factor)?;
-        }
       }
       return Ok(());
     }
@@ -2319,7 +2360,10 @@ pub enum PagePointer {
   Wheel {
     x: i32,
     y: i32,
-    delta: i32,
+    /// Horizontal wheel ticks in Win32 `WHEEL_DELTA` units (positive is tilt right).
+    delta_x: i32,
+    /// Vertical wheel ticks in Win32 `WHEEL_DELTA` units (positive is away from the user).
+    delta_y: i32,
     control: bool,
     shift: bool,
   },
@@ -2403,23 +2447,7 @@ impl PagePointer {
         };
         (kind, x, y, left, right, middle, control, shift, 0)
       }
-      Self::Wheel {
-        x,
-        y,
-        delta,
-        control,
-        shift,
-      } => (
-        COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
-        x,
-        y,
-        false,
-        false,
-        false,
-        control,
-        shift,
-        delta as u32,
-      ),
+      Self::Wheel { .. } => unreachable!("wheel events are sent in send_pointer"),
     };
     let mut keys = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE;
     if control {
@@ -2438,6 +2466,38 @@ impl PagePointer {
       keys |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_MIDDLE_BUTTON;
     }
     (kind, keys, data, POINT { x, y })
+  }
+}
+
+fn wheel_keys(control: bool, shift: bool) -> COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS {
+  let mut keys = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE;
+  if control {
+    keys |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_CONTROL;
+  }
+  if shift {
+    keys |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_SHIFT;
+  }
+  keys
+}
+
+/// Owns the message-only HWND used to dispatch custom-protocol replies until
+/// [`InnerWebView`] takes it. A failed open must not leak the window.
+struct DispatchWindow(HWND);
+
+impl DispatchWindow {
+  fn take(self) -> HWND {
+    let hwnd = self.0;
+    std::mem::forget(self);
+    hwnd
+  }
+}
+
+impl Drop for DispatchWindow {
+  fn drop(&mut self) {
+    if !self.0.is_invalid() {
+      // SAFETY: this window was created for composition dispatch and has no other owner yet.
+      let _ = unsafe { DestroyWindow(self.0) };
+    }
   }
 }
 
@@ -2495,11 +2555,12 @@ impl<T> UnsafeSend<T> {
 #[cfg(test)]
 mod tests {
   use super::{
-    is_work_around_uri, permission_state, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
-    COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION,
-    COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
-    COREWEBVIEW2_PERMISSION_STATE_DENY,
+    is_work_around_uri, permission_state, DispatchWindow, InnerWebView,
+    COREWEBVIEW2_PERMISSION_KIND_CAMERA, COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ,
+    COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION, COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
+    COREWEBVIEW2_PERMISSION_STATE_ALLOW, COREWEBVIEW2_PERMISSION_STATE_DENY,
   };
+  use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
   #[test]
   fn checks_if_custom_protocol_uri() {
@@ -2531,5 +2592,21 @@ mod tests {
       permission_state(COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION, true),
       None
     );
+  }
+
+  #[test]
+  fn a_failed_open_destroys_the_dispatch_window() {
+    let hwnd = InnerWebView::create_dispatch_hwnd().expect("dispatch window");
+    assert!(unsafe { IsWindow(Some(hwnd)).as_bool() });
+    drop(DispatchWindow(hwnd));
+    assert!(!unsafe { IsWindow(Some(hwnd)).as_bool() });
+  }
+
+  #[test]
+  fn take_keeps_the_dispatch_window() {
+    let hwnd = InnerWebView::create_dispatch_hwnd().expect("dispatch window");
+    let kept = DispatchWindow(hwnd).take();
+    assert!(unsafe { IsWindow(Some(kept)).as_bool() });
+    assert!(unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(kept).is_ok() });
   }
 }
