@@ -16,7 +16,7 @@ use once_cell::sync::Lazy;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use webview2_com::{Microsoft::Web::WebView2::Win32::*, *};
 use windows::{
-  core::{s, w, Interface, BOOL, HSTRING, PCWSTR, PWSTR},
+  core::{s, w, IUnknown, Interface, BOOL, HSTRING, PCWSTR, PWSTR},
   Win32::{
     Foundation::*,
     Globalization::*,
@@ -57,6 +57,8 @@ pub(crate) struct InnerWebView {
   parent: RefCell<HWND>,
   hwnd: HWND,
   is_child: bool,
+  /// The page is drawn into a DirectComposition visual, not a child window.
+  composed: bool,
   pub controller: ICoreWebView2Controller,
   pub webview: ICoreWebView2,
   pub env: ICoreWebView2Environment,
@@ -189,6 +191,7 @@ impl InnerWebView {
       hwnd,
       controller,
       is_child,
+      composed: false,
       webview,
       env,
       drag_drop_controller,
@@ -201,6 +204,76 @@ impl InnerWebView {
     }
 
     Ok(w)
+  }
+
+  /// Host the page in `root_visual` instead of a child window, so the caller can
+  /// place its own overlays above the page. IPC and custom protocols stay attached.
+  pub fn new_composed(
+    parent: &impl HasWindowHandle,
+    root_visual: *mut std::ffi::c_void,
+    mut attributes: WebViewAttributes,
+    pl_attrs: super::PlatformSpecificWebViewAttributes,
+  ) -> Result<Self> {
+    if root_visual.is_null() {
+      return Err(Error::Io(std::io::Error::other(
+        "missing composition visual",
+      )));
+    }
+    let parent = match parent.window_handle()?.as_raw() {
+      RawWindowHandle::Win32(window) => HWND(window.hwnd.get() as _),
+      _ => return Err(Error::UnsupportedWindowHandle),
+    };
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let hwnd = Self::create_dispatch_hwnd()?;
+    // File drops need a child window. The composition host has none.
+    let _ = attributes.drag_drop_handler.take();
+    let bounds = attributes.bounds;
+    let id = attributes
+      .id
+      .map(|id| id.to_string())
+      .unwrap_or_else(|| (hwnd.0 as isize).to_string());
+    let background_color = if attributes.transparent {
+      Some((0, 0, 0, 0))
+    } else {
+      attributes.background_color
+    };
+    let env = if let Some(env) = &pl_attrs.environment {
+      env.clone()
+    } else {
+      Self::create_environment(&attributes, pl_attrs.clone())?
+    };
+    let root = unsafe { borrowed_unknown(root_visual) };
+    let controller = Self::create_composition_controller(
+      parent,
+      &env,
+      attributes.incognito,
+      background_color,
+      &root,
+    )?;
+    // `is_child` skips the parent size subclass. The dispatch window is not the page.
+    let webview = Self::init_webview(
+      parent,
+      hwnd,
+      id.clone(),
+      attributes,
+      &env,
+      &controller,
+      pl_attrs,
+      true,
+    )?;
+    let view = Self {
+      id,
+      parent: RefCell::new(parent),
+      hwnd,
+      controller,
+      is_child: true,
+      composed: true,
+      webview,
+      env,
+      drag_drop_controller: None,
+    };
+    view.set_bounds(bounds.unwrap_or_default())?;
+    Ok(view)
   }
 
   #[inline]
@@ -262,6 +335,7 @@ impl InnerWebView {
       hwnd,
       controller,
       is_child,
+      composed: false,
       webview,
       env,
       drag_drop_controller,
@@ -376,6 +450,120 @@ impl InnerWebView {
     }?;
 
     Ok(hwnd)
+  }
+
+  fn create_dispatch_hwnd() -> Result<HWND> {
+    unsafe extern "system" fn dispatch_window_proc(
+      hwnd: HWND,
+      msg: u32,
+      wparam: WPARAM,
+      lparam: LPARAM,
+    ) -> LRESULT {
+      unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+    let class_name = w!("WRY_DISPATCH");
+    let class = WNDCLASSEXW {
+      cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+      style: CS_HREDRAW | CS_VREDRAW,
+      lpfnWndProc: Some(dispatch_window_proc),
+      cbClsExtra: 0,
+      cbWndExtra: 0,
+      hInstance: unsafe { HINSTANCE(GetModuleHandleW(PCWSTR::null()).unwrap_or_default().0) },
+      hIcon: HICON::default(),
+      hCursor: HCURSOR::default(),
+      hbrBackground: HBRUSH::default(),
+      lpszMenuName: PCWSTR::null(),
+      lpszClassName: class_name,
+      hIconSm: HICON::default(),
+    };
+    unsafe {
+      RegisterClassExW(&class);
+      CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        class_name,
+        w!("wry"),
+        WINDOW_STYLE::default(),
+        0,
+        0,
+        0,
+        0,
+        Some(HWND_MESSAGE),
+        None,
+        Some(HINSTANCE(
+          GetModuleHandleW(PCWSTR::null()).unwrap_or_default().0,
+        )),
+        None,
+      )
+      .map_err(Into::into)
+    }
+  }
+
+  fn create_composition_controller(
+    parent: HWND,
+    env: &ICoreWebView2Environment,
+    incognito: bool,
+    background_color: Option<(u8, u8, u8, u8)>,
+    root_visual: &IUnknown,
+  ) -> Result<ICoreWebView2Controller> {
+    let (tx, rx) = mpsc::channel();
+    let env10 = env.cast::<ICoreWebView2Environment10>()?;
+    let handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
+      move |error_code, controller| {
+        error_code?;
+        tx.send(controller.ok_or_else(|| windows::core::Error::from(E_POINTER)))
+          .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+      },
+    ));
+    unsafe {
+      let controller_opts = env10.CreateCoreWebView2ControllerOptions()?;
+      if let Some((r, g, b, mut a)) = background_color {
+        if let Ok(opts3) = controller_opts.cast::<ICoreWebView2ControllerOptions3>() {
+          if a != 0 {
+            a = 255;
+          }
+          opts3.SetDefaultBackgroundColor(COREWEBVIEW2_COLOR {
+            R: r,
+            G: g,
+            B: b,
+            A: a,
+          })?;
+        }
+      }
+      controller_opts.SetIsInPrivateModeEnabled(incognito)?;
+      env10.CreateCoreWebView2CompositionControllerWithOptions(
+        parent,
+        &controller_opts,
+        &handler,
+      )?;
+    }
+    let composition = webview2_com::wait_with_pump(rx)??;
+    unsafe { composition.SetRootVisualTarget(root_visual)? };
+    composition
+      .cast::<ICoreWebView2Controller>()
+      .map_err(Into::into)
+  }
+
+  pub fn set_root_visual(&self, root_visual: *mut std::ffi::c_void) -> Result<()> {
+    if root_visual.is_null() {
+      return Err(Error::Io(std::io::Error::other(
+        "missing composition visual",
+      )));
+    }
+    let root = unsafe { borrowed_unknown(root_visual) };
+    let composition = self
+      .controller
+      .cast::<ICoreWebView2CompositionController>()?;
+    unsafe { composition.SetRootVisualTarget(&root)? };
+    Ok(())
+  }
+
+  pub fn send_pointer(&self, event: PagePointer) -> Result<()> {
+    let composition = self
+      .controller
+      .cast::<ICoreWebView2CompositionController>()?;
+    let (kind, keys, data, point) = event.parts();
+    unsafe { composition.SendMouseInput(kind, keys, data, point)? };
+    Ok(())
   }
 
   #[inline]
@@ -728,24 +916,23 @@ impl InnerWebView {
       Self::add_script_to_execute_on_document_created(&webview, init_script.script)?;
     }
 
-    // Enable clipboard
-    if attributes.clipboard {
-      unsafe {
-        webview.add_PermissionRequested(
-          &PermissionRequestedEventHandler::create(Box::new(|_, args| {
-            let Some(args) = args else { return Ok(()) };
+    // Camera and microphone are always refused. Clipboard read stays opt-in.
+    let clipboard = attributes.clipboard;
+    unsafe {
+      webview.add_PermissionRequested(
+        &PermissionRequestedEventHandler::create(Box::new(move |_, args| {
+          let Some(args) = args else { return Ok(()) };
 
-            let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
-            args.PermissionKind(&mut kind)?;
-            if kind == COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ {
-              args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)?;
-            }
+          let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+          args.PermissionKind(&mut kind)?;
+          if let Some(state) = permission_state(kind, clipboard) {
+            args.SetState(state)?;
+          }
 
-            Ok(())
-          })),
-          &mut token,
-        )?;
-      }
+          Ok(())
+        })),
+        &mut token,
+      )?;
     }
 
     // Navigation
@@ -1635,6 +1822,11 @@ impl InnerWebView {
   pub fn bounds(&self) -> Result<Rect> {
     let mut bounds = Rect::default();
     let mut rect = RECT::default();
+    if self.composed {
+      unsafe { self.controller.Bounds(&mut rect)? };
+      bounds.size = PhysicalSize::new(rect.right - rect.left, rect.bottom - rect.top).into();
+      return Ok(bounds);
+    }
     if self.is_child {
       unsafe { GetClientRect(self.hwnd, &mut rect)? };
 
@@ -1682,8 +1874,28 @@ impl InnerWebView {
   }
 
   pub fn set_bounds(&self, bounds: Rect) -> Result<()> {
-    let dpi = unsafe { util::hwnd_dpi(self.hwnd) };
+    let hwnd = if self.composed {
+      *self.parent.borrow()
+    } else {
+      self.hwnd
+    };
+    let dpi = unsafe { util::hwnd_dpi(hwnd) };
     let scale_factor = util::dpi_to_scale_factor(dpi);
+    if self.composed {
+      let size = bounds.size.to_logical::<f64>(scale_factor);
+      unsafe {
+        self.controller.SetBounds(RECT {
+          top: 0,
+          left: 0,
+          right: size.width.round() as i32,
+          bottom: size.height.round() as i32,
+        })?;
+        if let Ok(controller) = self.controller.cast::<ICoreWebView2Controller3>() {
+          controller.SetRasterizationScale(scale_factor)?;
+        }
+      }
+      return Ok(());
+    }
     let size = bounds.size.to_physical::<i32>(scale_factor);
     let position = bounds.position.to_physical(scale_factor);
     self.set_bounds_inner(size, position)?;
@@ -1907,6 +2119,9 @@ impl InnerWebView {
   }
 
   pub fn reparent(&self, parent: isize) -> Result<()> {
+    if self.composed {
+      return Ok(());
+    }
     let parent = HWND(parent as _);
 
     unsafe {
@@ -2079,6 +2294,176 @@ fn apply_uri_work_around(uri: &str, http_or_https: &str, protocol: &str) -> Stri
   )
 }
 
+/// Pointer input for a page hosted in a composition visual.
+#[derive(Clone, Copy, Debug)]
+pub enum PagePointer {
+  Move {
+    x: i32,
+    y: i32,
+    left: bool,
+    right: bool,
+    middle: bool,
+    control: bool,
+    shift: bool,
+  },
+  Leave,
+  Button {
+    x: i32,
+    y: i32,
+    button: PageButton,
+    down: bool,
+    double: bool,
+    control: bool,
+    shift: bool,
+  },
+  Wheel {
+    x: i32,
+    y: i32,
+    delta: i32,
+    control: bool,
+    shift: bool,
+  },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PageButton {
+  Left,
+  Right,
+  Middle,
+}
+
+impl PagePointer {
+  fn parts(
+    self,
+  ) -> (
+    COREWEBVIEW2_MOUSE_EVENT_KIND,
+    COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS,
+    u32,
+    POINT,
+  ) {
+    let (kind, x, y, left, right, middle, control, shift, data) = match self {
+      Self::Move {
+        x,
+        y,
+        left,
+        right,
+        middle,
+        control,
+        shift,
+      } => (
+        COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
+        x,
+        y,
+        left,
+        right,
+        middle,
+        control,
+        shift,
+        0,
+      ),
+      Self::Leave => (
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        0,
+      ),
+      Self::Button {
+        x,
+        y,
+        button,
+        down,
+        double,
+        control,
+        shift,
+      } => {
+        let kind = match (button, down, double) {
+          (PageButton::Left, true, true) => COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK,
+          (PageButton::Left, true, false) => COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN,
+          (PageButton::Left, false, _) => COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
+          (PageButton::Right, true, true) => {
+            COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOUBLE_CLICK
+          }
+          (PageButton::Right, true, false) => COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOWN,
+          (PageButton::Right, false, _) => COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_UP,
+          (PageButton::Middle, true, true) => {
+            COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOUBLE_CLICK
+          }
+          (PageButton::Middle, true, false) => COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN,
+          (PageButton::Middle, false, _) => COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_UP,
+        };
+        let (left, right, middle) = match button {
+          PageButton::Left => (down, false, false),
+          PageButton::Right => (false, down, false),
+          PageButton::Middle => (false, false, down),
+        };
+        (kind, x, y, left, right, middle, control, shift, 0)
+      }
+      Self::Wheel {
+        x,
+        y,
+        delta,
+        control,
+        shift,
+      } => (
+        COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
+        x,
+        y,
+        false,
+        false,
+        false,
+        control,
+        shift,
+        delta as u32,
+      ),
+    };
+    let mut keys = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE;
+    if control {
+      keys |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_CONTROL;
+    }
+    if shift {
+      keys |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_SHIFT;
+    }
+    if left {
+      keys |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON;
+    }
+    if right {
+      keys |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_RIGHT_BUTTON;
+    }
+    if middle {
+      keys |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_MIDDLE_BUTTON;
+    }
+    (kind, keys, data, POINT { x, y })
+  }
+}
+
+fn permission_state(
+  kind: COREWEBVIEW2_PERMISSION_KIND,
+  clipboard: bool,
+) -> Option<COREWEBVIEW2_PERMISSION_STATE> {
+  if kind == COREWEBVIEW2_PERMISSION_KIND_CAMERA || kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE
+  {
+    Some(COREWEBVIEW2_PERMISSION_STATE_DENY)
+  } else if clipboard && kind == COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ {
+    Some(COREWEBVIEW2_PERMISSION_STATE_ALLOW)
+  } else {
+    None
+  }
+}
+
+/// `from_raw` takes a reference. Clone it, then forget the stolen one, so the
+/// caller's visual stays alive and this wrapper owns the extra reference.
+unsafe fn borrowed_unknown(raw: *mut std::ffi::c_void) -> IUnknown {
+  let stolen = unsafe { IUnknown::from_raw(raw) };
+  let borrowed = stolen.clone();
+  std::mem::forget(stolen);
+  borrowed
+}
+
 fn revert_uri_work_around(uri: &str, http_or_https: &str, protocol: &str) -> String {
   uri.replace(
     &work_around_uri_prefix(http_or_https, protocol),
@@ -2118,7 +2503,12 @@ impl<T> UnsafeSend<T> {
 
 #[cfg(test)]
 mod tests {
-  use super::is_work_around_uri;
+  use super::{
+    is_work_around_uri, permission_state, COREWEBVIEW2_PERMISSION_KIND_CAMERA,
+    COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION,
+    COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+    COREWEBVIEW2_PERMISSION_STATE_DENY,
+  };
 
   #[test]
   fn checks_if_custom_protocol_uri() {
@@ -2126,5 +2516,29 @@ mod tests {
     let uri = "http://wry.localhost/path/to/page";
     assert!(is_work_around_uri(uri, scheme, "wry"));
     assert!(!is_work_around_uri(uri, scheme, "asset"));
+  }
+
+  #[test]
+  fn camera_and_microphone_are_refused() {
+    assert_eq!(
+      permission_state(COREWEBVIEW2_PERMISSION_KIND_CAMERA, true),
+      Some(COREWEBVIEW2_PERMISSION_STATE_DENY)
+    );
+    assert_eq!(
+      permission_state(COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, false),
+      Some(COREWEBVIEW2_PERMISSION_STATE_DENY)
+    );
+    assert_eq!(
+      permission_state(COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, true),
+      Some(COREWEBVIEW2_PERMISSION_STATE_ALLOW)
+    );
+    assert_eq!(
+      permission_state(COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ, false),
+      None
+    );
+    assert_eq!(
+      permission_state(COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION, true),
+      None
+    );
   }
 }

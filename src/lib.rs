@@ -391,9 +391,9 @@ pub use wkwebview::{PrintMargin, PrintOptions, WryWebView};
 #[cfg(target_os = "windows")]
 pub(crate) mod webview2;
 #[cfg(target_os = "windows")]
-pub use self::webview2::ScrollBarStyle;
-#[cfg(target_os = "windows")]
 use self::webview2::*;
+#[cfg(target_os = "windows")]
+pub use self::webview2::{PageButton, PagePointer, ScrollBarStyle};
 #[cfg(target_os = "windows")]
 use webview2_com::Microsoft::Web::WebView2::Win32::{
   ICoreWebView2, ICoreWebView2Controller, ICoreWebView2Environment,
@@ -1465,6 +1465,23 @@ impl<'a> WebViewBuilder<'a> {
       .map(|webview| WebView { webview })
   }
 
+  /// Host the page in a DirectComposition visual owned by `window`.
+  ///
+  /// `root_visual` is an `IUnknown` of that visual. The page does not get a child window,
+  /// so the caller forwards pointer input with [`WebViewExtWindows::send_pointer`].
+  /// IPC and custom protocols are attached the same way as [`Self::build_as_child`].
+  #[cfg(target_os = "windows")]
+  pub fn build_as_composition<W: HasWindowHandle>(
+    self,
+    window: &W,
+    root_visual: *mut std::ffi::c_void,
+  ) -> Result<WebView> {
+    self.error?;
+
+    InnerWebView::new_composed(window, root_visual, self.attrs, self.platform_specific)
+      .map(|webview| WebView { webview })
+  }
+
   /// Consume the builder and create the [`WebView`] as a child window inside the provided [`HasWindowHandle`] in an async context.
   pub async fn build_as_child_async<W: HasWindowHandle>(self, window: &'a W) -> Result<WebView> {
     self.error?;
@@ -2253,6 +2270,12 @@ pub trait WebViewExtWindows {
 
   /// Attaches this webview to the given HWND and removes it from the current one.
   fn reparent(&self, hwnd: isize) -> Result<()>;
+
+  /// Points a composition-hosted page at a new visual after the compositor is recreated.
+  fn set_root_visual(&self, root_visual: *mut std::ffi::c_void) -> Result<()>;
+
+  /// Forwards one pointer event to a composition-hosted page.
+  fn send_pointer(&self, event: PagePointer) -> Result<()>;
 }
 
 #[cfg(target_os = "windows")]
@@ -2279,6 +2302,14 @@ impl WebViewExtWindows for WebView {
 
   fn reparent(&self, hwnd: isize) -> Result<()> {
     self.webview.reparent(hwnd)
+  }
+
+  fn set_root_visual(&self, root_visual: *mut std::ffi::c_void) -> Result<()> {
+    self.webview.set_root_visual(root_visual)
+  }
+
+  fn send_pointer(&self, event: PagePointer) -> Result<()> {
+    self.webview.send_pointer(event)
   }
 }
 
