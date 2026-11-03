@@ -245,11 +245,11 @@ impl InnerWebView {
       background_color,
       root_visual,
     )?;
-    let hwnd = hwnd.take();
-    // `is_child` skips the parent size subclass. The dispatch window is not the page.
+    // Borrow the guarded HWND through init. take() only after success so a failed
+    // init still destroys the dispatch window.
     let webview = Self::init_webview(
       parent,
-      hwnd,
+      hwnd.0,
       id.clone(),
       attributes,
       &env,
@@ -260,7 +260,7 @@ impl InnerWebView {
     let view = Self {
       id,
       parent: RefCell::new(parent),
-      hwnd,
+      hwnd: hwnd.take(),
       controller,
       is_child: true,
       composed: true,
@@ -552,6 +552,53 @@ impl InnerWebView {
     // SAFETY: root_visual is the caller's live composition visual. SetRootVisualTarget AddRefs it.
     unsafe { composition.SetRootVisualTarget(root_visual)? };
     Ok(())
+  }
+
+  pub fn on_cursor_changed(
+    &self,
+    handler: Box<dyn Fn(Option<*mut std::ffi::c_void>) + 'static>,
+  ) -> Result<()> {
+    let composition = self
+      .controller
+      .cast::<ICoreWebView2CompositionController>()?;
+    let mut token = 0;
+    // SAFETY: composition controller is this page's live host. The handler AddRefs through the token.
+    unsafe {
+      composition.add_CursorChanged(
+        &CursorChangedEventHandler::create(Box::new(move |sender, _| {
+          let Some(sender) = sender else {
+            return Ok(());
+          };
+          let mut cursor = HCURSOR::default();
+          sender.Cursor(&mut cursor)?;
+          handler(if cursor.is_invalid() {
+            None
+          } else {
+            Some(cursor.0)
+          });
+          Ok(())
+        })),
+        &mut token,
+      )?;
+    }
+    Ok(())
+  }
+
+  pub fn browser_process_exited(&self) -> Result<std::sync::mpsc::Receiver<()>> {
+    let (tx, rx) = mpsc::channel();
+    let env5 = self.env.cast::<ICoreWebView2Environment5>()?;
+    let mut token = 0;
+    // SAFETY: env is this page's environment. The handler runs once on process exit and only sends.
+    unsafe {
+      env5.add_BrowserProcessExited(
+        &BrowserProcessExitedEventHandler::create(Box::new(move |_, _| {
+          let _ = tx.send(());
+          Ok(())
+        })),
+        &mut token,
+      )?;
+    }
+    Ok(rx)
   }
 
   pub fn send_pointer(&self, event: PagePointer) -> Result<()> {
@@ -1123,27 +1170,26 @@ impl InnerWebView {
       )?;
     }
 
-    // Navigation handler
+    // Navigation handler — main frame and iframes share the same policy (decisions 117, 121).
     if let Some(nav_callback) = attributes.navigation_handler.take() {
-      webview.add_NavigationStarting(
-        &NavigationStartingEventHandler::create(Box::new(move |_, args| {
-          let Some(args) = args else {
-            return Ok(());
-          };
+      let handler = NavigationStartingEventHandler::create(Box::new(move |_, args| {
+        let Some(args) = args else {
+          return Ok(());
+        };
 
-          let uri = {
-            let mut uri = PWSTR::null();
-            args.Uri(&mut uri)?;
-            take_pwstr(uri)
-          };
+        let uri = {
+          let mut uri = PWSTR::null();
+          args.Uri(&mut uri)?;
+          take_pwstr(uri)
+        };
 
-          let allow = nav_callback(uri);
-          args.SetCancel(!allow)?;
+        let allow = nav_callback(uri);
+        args.SetCancel(!allow)?;
 
-          Ok(())
-        })),
-        token,
-      )?;
+        Ok(())
+      }));
+      webview.add_NavigationStarting(&handler, token)?;
+      webview.add_FrameNavigationStarting(&handler, token)?;
     }
 
     let new_window_req_handler = attributes
@@ -2608,5 +2654,46 @@ mod tests {
     let kept = DispatchWindow(hwnd).take();
     assert!(unsafe { IsWindow(Some(kept)).as_bool() });
     assert!(unsafe { windows::Win32::UI::WindowsAndMessaging::DestroyWindow(kept).is_ok() });
+  }
+
+  #[test]
+  fn a_failed_init_after_the_controller_still_destroys_the_dispatch_window() {
+    // Mirrors new_composed: borrow hwnd.0 through a failing init, take only on success.
+    let hwnd = DispatchWindow(InnerWebView::create_dispatch_hwnd().expect("dispatch window"));
+    let raw = hwnd.0;
+    let init =
+      |_: windows::Win32::Foundation::HWND| -> Result<(), &'static str> { Err("settings failed") };
+    assert!(init(hwnd.0).is_err());
+    drop(hwnd);
+    assert!(
+      !unsafe { IsWindow(Some(raw)).as_bool() },
+      "guard must still own the HWND when init fails before take()"
+    );
+  }
+
+  #[test]
+  fn navigation_policy_refuses_frame_schemes_hosts_and_redirects() {
+    // Same predicate is registered for NavigationStarting and FrameNavigationStarting.
+    let allow = |uri: &str| {
+      let Some((scheme, rest)) = uri.split_once("://") else {
+        return false;
+      };
+      let host = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+      matches!(scheme, "http" | "https") && matches!(host, "allowed.example" | "localhost")
+    };
+    assert!(allow("https://allowed.example/page"));
+    assert!(allow("http://localhost:3000/"));
+    assert!(!allow("javascript:alert(1)"), "refused frame scheme");
+    assert!(!allow("https://evil.example/embed"), "refused frame host");
+    assert!(
+      !allow("https://evil.example/redirect"),
+      "refused frame redirect target"
+    );
   }
 }

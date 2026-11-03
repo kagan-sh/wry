@@ -2276,6 +2276,17 @@ pub trait WebViewExtWindows {
 
   /// Forwards one pointer event to a composition-hosted page.
   fn send_pointer(&self, event: PagePointer) -> Result<()>;
+
+  /// Invokes `handler` when the page wants a new cursor. The argument is an `HCURSOR`
+  /// as a raw pointer, or `None` when the page clears it.
+  fn on_cursor_changed(
+    &self,
+    handler: Box<dyn Fn(Option<*mut std::ffi::c_void>) + 'static>,
+  ) -> Result<()>;
+
+  /// Signals once when the WebView2 browser process for this environment has exited.
+  /// Register before dropping the page so user-data cleanup can wait.
+  fn browser_process_exited(&self) -> Result<std::sync::mpsc::Receiver<()>>;
 }
 
 #[cfg(target_os = "windows")]
@@ -2310,6 +2321,17 @@ impl WebViewExtWindows for WebView {
 
   fn send_pointer(&self, event: PagePointer) -> Result<()> {
     self.webview.send_pointer(event)
+  }
+
+  fn on_cursor_changed(
+    &self,
+    handler: Box<dyn Fn(Option<*mut std::ffi::c_void>) + 'static>,
+  ) -> Result<()> {
+    self.webview.on_cursor_changed(handler)
+  }
+
+  fn browser_process_exited(&self) -> Result<std::sync::mpsc::Receiver<()>> {
+    self.webview.browser_process_exited()
   }
 }
 
