@@ -210,19 +210,15 @@ impl InnerWebView {
   /// place its own overlays above the page. IPC and custom protocols stay attached.
   pub fn new_composed(
     parent: &impl HasWindowHandle,
-    root_visual: *mut std::ffi::c_void,
+    root_visual: &IUnknown,
     mut attributes: WebViewAttributes,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
   ) -> Result<Self> {
-    if root_visual.is_null() {
-      return Err(Error::Io(std::io::Error::other(
-        "missing composition visual",
-      )));
-    }
     let parent = match parent.window_handle()?.as_raw() {
       RawWindowHandle::Win32(window) => HWND(window.hwnd.get() as _),
       _ => return Err(Error::UnsupportedWindowHandle),
     };
+    // SAFETY: WebView2 COM calls on this thread need an STA. A second call returns S_FALSE.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
     let hwnd = Self::create_dispatch_hwnd()?;
     // File drops need a child window. The composition host has none.
@@ -242,13 +238,12 @@ impl InnerWebView {
     } else {
       Self::create_environment(&attributes, pl_attrs.clone())?
     };
-    let root = unsafe { borrowed_unknown(root_visual) };
     let controller = Self::create_composition_controller(
       parent,
       &env,
       attributes.incognito,
       background_color,
-      &root,
+      root_visual,
     )?;
     // `is_child` skips the parent size subclass. The dispatch window is not the page.
     let webview = Self::init_webview(
@@ -459,6 +454,7 @@ impl InnerWebView {
       wparam: WPARAM,
       lparam: LPARAM,
     ) -> LRESULT {
+      // SAFETY: this window only dispatches posted messages. DefWindowProcW is its handler.
       unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
     let class_name = w!("WRY_DISPATCH");
@@ -468,6 +464,7 @@ impl InnerWebView {
       lpfnWndProc: Some(dispatch_window_proc),
       cbClsExtra: 0,
       cbWndExtra: 0,
+      // SAFETY: a null module name is this process, and the handle is only stored on the class.
       hInstance: unsafe { HINSTANCE(GetModuleHandleW(PCWSTR::null()).unwrap_or_default().0) },
       hIcon: HICON::default(),
       hCursor: HCURSOR::default(),
@@ -476,6 +473,8 @@ impl InnerWebView {
       lpszClassName: class_name,
       hIconSm: HICON::default(),
     };
+    // SAFETY: the class name is a static wide string. A null module name is this process.
+    // HWND_MESSAGE is not a child of the GPUI window.
     unsafe {
       RegisterClassExW(&class);
       CreateWindowExW(
@@ -514,6 +513,7 @@ impl InnerWebView {
           .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
       },
     ));
+    // SAFETY: env10 is this page's WebView2 environment. The handler stays alive until wait_with_pump returns.
     unsafe {
       let controller_opts = env10.CreateCoreWebView2ControllerOptions()?;
       if let Some((r, g, b, mut a)) = background_color {
@@ -537,23 +537,19 @@ impl InnerWebView {
       )?;
     }
     let composition = webview2_com::wait_with_pump(rx)??;
+    // SAFETY: root_visual is the caller's live composition visual. SetRootVisualTarget AddRefs it.
     unsafe { composition.SetRootVisualTarget(root_visual)? };
     composition
       .cast::<ICoreWebView2Controller>()
       .map_err(Into::into)
   }
 
-  pub fn set_root_visual(&self, root_visual: *mut std::ffi::c_void) -> Result<()> {
-    if root_visual.is_null() {
-      return Err(Error::Io(std::io::Error::other(
-        "missing composition visual",
-      )));
-    }
-    let root = unsafe { borrowed_unknown(root_visual) };
+  pub fn set_root_visual(&self, root_visual: &IUnknown) -> Result<()> {
     let composition = self
       .controller
       .cast::<ICoreWebView2CompositionController>()?;
-    unsafe { composition.SetRootVisualTarget(&root)? };
+    // SAFETY: root_visual is the caller's live composition visual. SetRootVisualTarget AddRefs it.
+    unsafe { composition.SetRootVisualTarget(root_visual)? };
     Ok(())
   }
 
@@ -562,6 +558,7 @@ impl InnerWebView {
       .controller
       .cast::<ICoreWebView2CompositionController>()?;
     let (kind, keys, data, point) = event.parts();
+    // SAFETY: this controller was created for the composition host, and the point is in its client DIPs.
     unsafe { composition.SendMouseInput(kind, keys, data, point)? };
     Ok(())
   }
@@ -1823,6 +1820,7 @@ impl InnerWebView {
     let mut bounds = Rect::default();
     let mut rect = RECT::default();
     if self.composed {
+      // SAFETY: the controller belongs to this page and is alive for the call.
       unsafe { self.controller.Bounds(&mut rect)? };
       bounds.size = PhysicalSize::new(rect.right - rect.left, rect.bottom - rect.top).into();
       return Ok(bounds);
@@ -1879,10 +1877,12 @@ impl InnerWebView {
     } else {
       self.hwnd
     };
+    // SAFETY: hwnd is the GPUI window when the page is composed, otherwise this page's child window.
     let dpi = unsafe { util::hwnd_dpi(hwnd) };
     let scale_factor = util::dpi_to_scale_factor(dpi);
     if self.composed {
       let size = bounds.size.to_logical::<f64>(scale_factor);
+      // SAFETY: the controller belongs to this page. The rect is the page size in DIPs at the parent DPI.
       unsafe {
         self.controller.SetBounds(RECT {
           top: 0,
@@ -2453,15 +2453,6 @@ fn permission_state(
   } else {
     None
   }
-}
-
-/// `from_raw` takes a reference. Clone it, then forget the stolen one, so the
-/// caller's visual stays alive and this wrapper owns the extra reference.
-unsafe fn borrowed_unknown(raw: *mut std::ffi::c_void) -> IUnknown {
-  let stolen = unsafe { IUnknown::from_raw(raw) };
-  let borrowed = stolen.clone();
-  std::mem::forget(stolen);
-  borrowed
 }
 
 fn revert_uri_work_around(uri: &str, http_or_https: &str, protocol: &str) -> String {

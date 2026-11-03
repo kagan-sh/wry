@@ -1474,7 +1474,7 @@ impl<'a> WebViewBuilder<'a> {
   pub fn build_as_composition<W: HasWindowHandle>(
     self,
     window: &W,
-    root_visual: *mut std::ffi::c_void,
+    root_visual: &windows::core::IUnknown,
   ) -> Result<WebView> {
     self.error?;
 
@@ -2272,7 +2272,7 @@ pub trait WebViewExtWindows {
   fn reparent(&self, hwnd: isize) -> Result<()>;
 
   /// Points a composition-hosted page at a new visual after the compositor is recreated.
-  fn set_root_visual(&self, root_visual: *mut std::ffi::c_void) -> Result<()>;
+  fn set_root_visual(&self, root_visual: &windows::core::IUnknown) -> Result<()>;
 
   /// Forwards one pointer event to a composition-hosted page.
   fn send_pointer(&self, event: PagePointer) -> Result<()>;
@@ -2304,7 +2304,7 @@ impl WebViewExtWindows for WebView {
     self.webview.reparent(hwnd)
   }
 
-  fn set_root_visual(&self, root_visual: *mut std::ffi::c_void) -> Result<()> {
+  fn set_root_visual(&self, root_visual: &windows::core::IUnknown) -> Result<()> {
     self.webview.set_root_visual(root_visual)
   }
 
