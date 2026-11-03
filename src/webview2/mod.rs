@@ -584,11 +584,15 @@ impl InnerWebView {
     Ok(())
   }
 
-  pub fn browser_process_exited(&self) -> Result<std::sync::mpsc::Receiver<()>> {
+  pub fn browser_process_exited(
+    &self,
+  ) -> Result<(mpsc::Receiver<()>, ICoreWebView2Environment)> {
     let (tx, rx) = mpsc::channel();
-    let env5 = self.env.cast::<ICoreWebView2Environment5>()?;
+    let env = self.env.clone();
+    let env5 = env.cast::<ICoreWebView2Environment5>()?;
     let mut token = 0;
     // SAFETY: env is this page's environment. The handler runs once on process exit and only sends.
+    // The caller must keep `env` until the wait ends; dropping the page alone would drop the handler.
     unsafe {
       env5.add_BrowserProcessExited(
         &BrowserProcessExitedEventHandler::create(Box::new(move |_, _| {
@@ -598,7 +602,7 @@ impl InnerWebView {
         &mut token,
       )?;
     }
-    Ok(rx)
+    Ok((rx, env))
   }
 
   pub fn send_pointer(&self, event: PagePointer) -> Result<()> {

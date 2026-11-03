@@ -2285,8 +2285,11 @@ pub trait WebViewExtWindows {
   ) -> Result<()>;
 
   /// Signals once when the WebView2 browser process for this environment has exited.
-  /// Register before dropping the page so user-data cleanup can wait.
-  fn browser_process_exited(&self) -> Result<std::sync::mpsc::Receiver<()>>;
+  /// Register before dropping the page so user-data cleanup can wait. The environment
+  /// must be held until the wait ends; it owns the handler.
+  fn browser_process_exited(
+    &self,
+  ) -> Result<(std::sync::mpsc::Receiver<()>, ICoreWebView2Environment)>;
 }
 
 #[cfg(target_os = "windows")]
@@ -2330,7 +2333,9 @@ impl WebViewExtWindows for WebView {
     self.webview.on_cursor_changed(handler)
   }
 
-  fn browser_process_exited(&self) -> Result<std::sync::mpsc::Receiver<()>> {
+  fn browser_process_exited(
+    &self,
+  ) -> Result<(std::sync::mpsc::Receiver<()>, ICoreWebView2Environment)> {
     self.webview.browser_process_exited()
   }
 }
