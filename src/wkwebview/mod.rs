@@ -1260,8 +1260,14 @@ r#"Object.defineProperty(window, 'ipc', {
 }
 
 pub fn url_from_webview(webview: &WKWebView) -> Result<String> {
-  let url_obj = unsafe { webview.URL().unwrap() };
-  let absolute_url = unsafe { url_obj.absoluteString().unwrap() };
+  // A load that never commits, such as a host that does not exist, leaves this nil.
+  // Unwrapping it aborts the app that asked for the address.
+  let Some(url_obj) = (unsafe { webview.URL() }) else {
+    return Ok(String::new());
+  };
+  let Some(absolute_url) = (unsafe { url_obj.absoluteString() }) else {
+    return Ok(String::new());
+  };
 
   let bytes = {
     let bytes: *const c_char = absolute_url.UTF8String();
